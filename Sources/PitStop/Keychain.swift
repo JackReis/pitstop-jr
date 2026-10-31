@@ -71,22 +71,49 @@ enum Keychain {
     /// `security` exits 44 when no matching item exists.
     private static let notFound: Int32 = 44
 
-    /// Read a generic password. Pass `account: nil` to match by service alone.
+    /// Read a generic password. When `account` is nil (the live Claude Code
+    /// credential lookup), prefer the item keyed by `NSUserName()` — matching
+    /// Claude Code's own `find-generic-password -a $USER -s ...` — and only
+    /// fall back to an unscoped service match if no per-user item exists. A
+    /// daemon invocation of Claude Code without `$USER` in its environment
+    /// writes a separate item under `"unknown"` or `"claude-code-user"`; if
+    /// that item was created earlier, an unscoped `-s` lookup returns the
+    /// stale daemon item instead of the user's live session.
+    ///
     /// When a specific account is missing, falls back to (and promotes) its
     /// staging sibling — a crash between upsert's delete and add can leave the
     /// only copy there.
     static func read(service: String, account: String? = nil) async throws -> Data? {
-        if let data = try await readRaw(service: service, account: account) { return data }
-        guard let account,
-              let staged = try? await readRaw(service: service,
-                                              account: stagingAccount(for: account)),
+        try await read(
+            service: service,
+            account: account,
+            user: NSUserName(),
+            fetch: { try await readRaw(service: service, account: $0) },
+            promote: { stagedAccount, value in
+                let r = try? await run(["add-generic-password", "-s", service, "-a", stagedAccount, "-w", value])
+                if r?.status == 0 {
+                    _ = try? await run(["delete-generic-password", "-s", service,
+                                        "-a", stagingAccount(for: stagedAccount)])
+                }
+            })
+    }
+
+    static func read(
+        service: String,
+        account: String?,
+        user: String,
+        fetch: (String?) async throws -> Data?,
+        promote: (String, String) async -> Void = { _, _ in }
+    ) async throws -> Data? {
+        guard let account else {
+            if let data = try await fetch(user) { return data }
+            return try await fetch(nil)
+        }
+        if let data = try await fetch(account) { return data }
+        guard let staged = try? await fetch(stagingAccount(for: account)),
               let value = String(data: staged, encoding: .utf8) else { return nil }
         // Promote the stranded copy back to the real item (best-effort).
-        let r = try? await run(["add-generic-password", "-s", service, "-a", account, "-w", value])
-        if r?.status == 0 {
-            _ = try? await run(["delete-generic-password", "-s", service,
-                                "-a", stagingAccount(for: account)])
-        }
+        await promote(account, value)
         return staged
     }
 
@@ -198,9 +225,19 @@ enum Keychain {
     }
 
     /// The `acct` attribute of an existing item — a metadata read, which
-    /// never needs ACL authorization (no prompt).
-    private static func accountAttribute(service: String) async -> String? {
-        guard let r = try? await run(["find-generic-password", "-s", service]),
+    /// never needs ACL authorization (no prompt). Prefers the `NSUserName()`
+    /// item when one exists so a stale `"unknown"` item earlier in keychain
+    /// order can't divert live writes away from the item Claude Code reads.
+    static func accountAttribute(
+        service: String,
+        user: String = NSUserName(),
+        query: ([String]) async throws -> (status: Int32, out: Data, err: String) = { try await run($0) }
+    ) async -> String? {
+        if let r = try? await query(["find-generic-password", "-s", service, "-a", user]),
+           r.status == 0 {
+            return user
+        }
+        guard let r = try? await query(["find-generic-password", "-s", service]),
               r.status == 0 else { return nil }
         let text = (String(data: r.out, encoding: .utf8) ?? "") + r.err
         for line in text.split(separator: "\n")
